@@ -1,0 +1,1530 @@
+import React, { useState,  useMemo, useRef, useEffect } from 'react';
+import { 
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, 
+  ScatterChart, Scatter, ZAxis, ReferenceLine, ReferenceArea, ComposedChart 
+} from 'recharts';
+import { 
+  Upload, FileText, Trash2, Download, Settings, BarChart2, ChevronDown, ChevronUp, 
+  AlertCircle, Search, Sparkles, Loader2, Activity, Thermometer, AlertTriangle, ArrowRightLeft,
+  MoveHorizontal, Table2, ListFilter, Plus, X, GripVertical, Copy, Check, SlidersHorizontal, Filter, Eraser, ArrowDownToLine
+} from 'lucide-react';
+
+// --- Constants & Helper Functions ---
+
+const apiKey = ""; // The execution environment provides the key at runtime.
+
+const COMMON_PARAMS = [
+  // 系統功耗與核心資訊 (保留)
+  'Total System Power [W]', 'CPU Package Power [W]', ' 1:TGP (W)', 'Charge Rate [W]',
+  'IA Cores Power [W]', 'GT Cores Power [W]', ' 1:NVVDD Power (W)', ' 1:FBVDD Power (W)',
+  'CPU Package [蚓]', ' 1:Temperature GPU (C)', ' 1:Temperature Memory (C)', 
+  
+  // 使用者指定常用溫度參數 (依指定順序)
+  'TCPU-CPU-temp(Degree C)', 
+  'CHRG-temp(Degree C)', 
+  'TMEM-temp(Degree C)', // 修正 MEM 為截圖中常見的 TMEM
+  'CPUV-temp(Degree C)', 
+  'TSSD-temp(Degree C)', 
+  'BSKN-temp(Degree C)', 
+  'BATT-temp(Degree C)', 
+  'GPUV-temp(Degree C)', 
+  'GPUD-temp(Degree C)', 
+  'TOTP-temp(Degree C)',
+
+  // 其他通用 SEN 測點 (保留於後段)
+  'SEN1-temp(Degree C)', 'SEN2-temp(Degree C)', 'SEN3-temp(Degree C)', 'SEN4-temp(Degree C)',
+  'SEN5-temp(Degree C)', 'SEN6-temp(Degree C)', 'SEN7-temp(Degree C)', 'SEN8-temp(Degree C)', 'SEN9-temp(Degree C)'
+];
+
+const COLORS = [
+  '#8884d8', '#82ca9d', '#ffc658', '#ff7300', '#0088fe', '#00c49f', 
+  '#ffbb28', '#ff8042', '#a4de6c', '#d0ed57', '#8dd1e1', '#a4c8e0'
+];
+
+const normalize = (col) => {
+  if (typeof col !== 'string') return "";
+  const baseName = col.replace(/_\d+$/, "");
+  return baseName.trim().toLowerCase()
+    .replace(/\s/g, "")
+    .replace(/:/g, "")
+    .replace(/（/g, "(")
+    .replace(/）/g, ")");
+};
+
+const classifyFile = (filename) => {
+  const lower = filename.toLowerCase();
+  if (lower.includes("gpu")) return "GPUmon";
+  if (lower.includes("ptat")) return "PTAT";
+  if (lower.includes("hw")) return "HW64";
+  return "Other";
+};
+
+const parseCSV = (text) => {
+  const rows = [];
+  let currentRow = [];
+  let currentVal = '';
+  let insideQuote = false;
+  
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === '"') {
+      insideQuote = !insideQuote;
+    } else if (char === ',' && !insideQuote) {
+      currentRow.push(currentVal.trim());
+      currentVal = '';
+    } else if ((char === '\n' || char === '\r') && !insideQuote) {
+      if (currentVal || currentRow.length > 0) {
+        currentRow.push(currentVal.trim());
+        rows.push(currentRow);
+      }
+      currentRow = [];
+      currentVal = '';
+      if (char === '\r' && text[i+1] === '\n') i++;
+    } else {
+      currentVal += char;
+    }
+  }
+  if (currentVal || currentRow.length > 0) {
+    currentRow.push(currentVal.trim());
+    rows.push(currentRow);
+  }
+  return rows;
+};
+
+// Fallback copy function for iframe environments
+const copyToClipboard = (text) => {
+  try {
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    
+    // Ensure textarea is not visible
+    textArea.style.position = "fixed";
+    textArea.style.left = "-9999px";
+    textArea.style.top = "0";
+    
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    
+    const successful = document.execCommand('copy');
+    document.body.removeChild(textArea);
+    return successful;
+  } catch (err) {
+    console.error('Fallback: Oops, unable to copy', err);
+    return false;
+  }
+};
+
+// --- Main Component ---
+
+export default function ThermalLogAnalyzer() {
+  const [files, setFiles] = useState([]);
+  const [chartTitle, setChartTitle] = useState("跨檔案多欄位比較圖");
+  const [loading, setLoading] = useState(false);
+  const fileInputRef = useRef(null);
+  
+  // AI Analysis State
+  const [aiAnalysis, setAiAnalysis] = useState("");
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [aiError, setAiError] = useState(null);
+
+  // Advanced Features State
+  const [chartMode, setChartMode] = useState('time'); // 'time' or 'xy'
+  const [xyConfig, setXyConfig] = useState({ x: '', y: '' });
+  
+  // Steady State
+  const [steadyStateConfig, setSteadyStateConfig] = useState({ 
+    enabled: false, 
+    windowSize: 60, // seconds/points 
+    threshold: 0.5, // degC per minute (approx)
+    targetKey: '' 
+  });
+
+  // Throttling
+  const [throttlingConfig, setThrottlingConfig] = useState({
+    enabled: false,
+    tempThreshold: 90,
+    powerDropPercent: 15
+  });
+
+  // Skin Temp Limits
+  const [skinTempLimits, setSkinTempLimits] = useState({});
+  const [showSkinSettings, setShowSkinSettings] = useState(false);
+
+  // Axis Settings
+  const [showAxisSettings, setShowAxisSettings] = useState(false);
+  const [yAxisConfig, setYAxisConfig] = useState({
+    left: { min: '', max: '' },
+    right: { min: '', max: '' }
+  });
+  // Store column names that should be on the right axis
+  const [rightAxisCols, setRightAxisCols] = useState(new Set());
+
+  // Global Search State
+  const [showGlobalSearch, setShowGlobalSearch] = useState(false);
+  const [globalSearchTerm, setGlobalSearchTerm] = useState("");
+  const [globalFileFilter, setGlobalFileFilter] = useState("ALL");
+
+  // Summary Params State (Merged default + user selected, handling order)
+  const [summaryParamsOrder, setSummaryParamsOrder] = useState(COMMON_PARAMS);
+  const [showSummarySelector, setShowSummarySelector] = useState(false);
+  const [summarySearchTerm, setSummarySearchTerm] = useState("");
+  const [summaryFileFilter, setSummaryFileFilter] = useState("ALL");
+  
+  // Copy feedback state
+  const [copiedColumn, setCopiedColumn] = useState(null);
+
+  // Drag and Drop Refs
+  const dragItem = useRef(null);
+  const dragOverItem = useRef(null);
+
+  // File Processing Logic
+  const handleFileUpload = async (event) => {
+    const uploadedFiles = Array.from(event.target.files);
+    setLoading(true);
+
+    const newProcessedFiles = [];
+
+    for (const file of uploadedFiles) {
+      try {
+        const fileType = classifyFile(file.name);
+        
+        const text = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = (e) => resolve(e.target.result);
+          reader.onerror = (e) => reject(e);
+          reader.readAsText(file, 'big5'); 
+        });
+
+        let allLines = text.split(/\r\n|\n|\r/);
+        let rawData = [];
+        let headers = [];
+
+        if (fileType === "GPUmon") {
+          const contentLines = allLines.slice(35).filter(l => l.trim() !== "");
+          const parsed = parseCSV(contentLines.join('\n'));
+          if (parsed.length > 0) {
+            headers = parsed[0];
+            rawData = parsed.slice(1);
+          }
+        } else if (fileType === "PTAT") {
+          const parsed = parseCSV(text);
+          if (parsed.length > 0) {
+            headers = parsed[0];
+            rawData = parsed.slice(1 + 5); 
+          }
+        } else if (fileType === "HW64") {
+          let parsed = parseCSV(text);
+          if (parsed.length > 0) {
+            parsed = parsed.filter(row => row.length > 1);
+            headers = parsed[0];
+            headers = headers.slice(0, headers.length - 6);
+            let body = parsed.slice(1);
+            if (body.length > 2) body = body.slice(0, body.length - 2);
+            rawData = body.map(row => row.slice(0, headers.length));
+          }
+        } else {
+          const parsed = parseCSV(text);
+          if (parsed.length > 0) {
+            headers = parsed[0];
+            rawData = parsed.slice(1);
+          }
+        }
+
+        const headerCounts = {};
+        headers = headers.map(h => {
+          const name = h.trim();
+          if (headerCounts[name] !== undefined) {
+            headerCounts[name]++;
+            return `${name}_${headerCounts[name]}`;
+          }
+          headerCounts[name] = 0;
+          return name;
+        });
+
+        const processedData = rawData.map(row => {
+          const obj = {};
+          headers.forEach((h, i) => {
+            const val = row[i] ? parseFloat(row[i]) : NaN;
+            obj[h] = val;
+          });
+          return obj;
+        });
+
+        newProcessedFiles.push({
+          id: Math.random().toString(36).substr(2, 9),
+          name: file.name,
+          shortName: file.name.split('/').pop(),
+          type: fileType,
+          headers: headers,
+          data: processedData,
+          selectedCols: [],
+          range: { start: 0, end: processedData.length }
+        });
+
+      } catch (err) {
+        console.error(`Error processing ${file.name}`, err);
+        alert(`無法讀取檔案 ${file.name}`);
+      }
+    }
+
+    setFiles(prev => [...prev, ...newProcessedFiles]);
+    setLoading(false);
+    if(fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const removeFile = (id) => {
+    setFiles(files.filter(f => f.id !== id));
+  };
+
+  const updateFileSelection = (id, field, value) => {
+    setFiles(files.map(f => {
+      if (f.id === id) {
+        return { ...f, [field]: value };
+      }
+      return f;
+    }));
+  };
+
+  // --- Handlers ---
+  
+  const handleClearAll = () => {
+    setFiles(prev => prev.map(f => ({ ...f, selectedCols: [] })));
+  };
+
+  const handleAddSelectedToSummary = () => {
+    // 1. Get all currently displayed params in summary (to avoid duplicates)
+    // Fix: use summaryParamsOrder directly as it is the state of truth for display
+    const currentParams = new Set(summaryParamsOrder);
+    const newParams = new Set();
+    
+    // 2. Iterate all files and find their selected chart columns
+    files.forEach(f => {
+      f.selectedCols.forEach(col => {
+        // Check if this param (by normalized name) already exists
+        const normCol = normalize(col);
+        const exists = [...currentParams].some(p => normalize(p) === normCol);
+        
+        if (!exists) {
+          newParams.add(col);
+        }
+      });
+    });
+
+    // 3. Update state if there are new params
+    if (newParams.size > 0) {
+      const added = Array.from(newParams);
+      setSummaryParamsOrder(prev => [...prev, ...added]);
+    }
+  };
+
+  const calculateStats = (data, col) => {
+    const values = data.map(d => d[col]).filter(v => !isNaN(v));
+    if (values.length === 0) return { max: '-', min: '-', mean: '-' };
+    const max = Math.max(...values);
+    const min = Math.min(...values);
+    const sum = values.reduce((a, b) => a + b, 0);
+    return {
+      max: max.toFixed(2),
+      min: min.toFixed(2),
+      mean: (sum / values.length).toFixed(2)
+    };
+  };
+
+  // Replaces the old commonParamsData logic with one that respects summaryParamsOrder
+  const commonParamsData = useMemo(() => {
+    const results = [];
+    const addedKeys = new Set();
+    
+    files.forEach(file => {
+      const tailData = file.data.slice(-600);
+      
+      summaryParamsOrder.forEach(param => {
+        const key = normalize(param);
+        if (addedKeys.has(key)) return;
+
+        const match = file.headers.find(h => normalize(h) === key);
+        if (match) {
+          const values = tailData.map(d => d[match]).filter(v => !isNaN(v));
+          const valStr = values.length > 0 
+            ? (values.reduce((a,b)=>a+b,0) / values.length).toFixed(2) 
+            : "-";
+          results.push({ 
+            param, 
+            value: valStr, 
+            isCustom: !COMMON_PARAMS.includes(param) 
+          });
+          addedKeys.add(key);
+        }
+      });
+    });
+
+    // Sort results based on summaryParamsOrder
+    const ordered = [];
+    summaryParamsOrder.forEach(p => {
+      const found = results.find(r => normalize(r.param) === normalize(p));
+      if (found) ordered.push(found);
+    });
+    return ordered;
+  }, [files, summaryParamsOrder]);
+
+  const activeLines = useMemo(() => {
+    const lines = [];
+    let colorIdx = 0;
+    files.forEach(f => {
+      f.selectedCols.forEach(col => {
+        lines.push({
+          key: `${f.shortName} - ${col}`,
+          displayName: col,
+          color: COLORS[colorIdx % COLORS.length],
+          fileId: f.id,
+          colName: col,
+          isRightAxis: rightAxisCols.has(col)
+        });
+        colorIdx++;
+      });
+    });
+    return lines;
+  }, [files, rightAxisCols]);
+
+  // Set default XY config when lines are added
+  useEffect(() => {
+    if (activeLines.length >= 2 && (!xyConfig.x || !xyConfig.y)) {
+      // Try to find reasonable defaults: Power for X, Temp for Y
+      let x = activeLines.find(l => l.displayName.includes("Power"))?.key || activeLines[0]?.key;
+      let y = activeLines.find(l => l.displayName.includes("Temp") || l.displayName.includes("Package"))?.key || activeLines[1]?.key;
+      setXyConfig({ x, y });
+    } else if (activeLines.length === 1 && !xyConfig.x) {
+      setXyConfig({ x: activeLines[0].key, y: activeLines[0].key });
+    }
+  }, [activeLines.length]); // Dependency on length changes
+
+  // Set default steady state target
+  useEffect(() => {
+    if (!steadyStateConfig.targetKey && activeLines.length > 0) {
+      const tempLine = activeLines.find(l => l.displayName.includes("Temp") || l.displayName.includes("Package"));
+      if (tempLine) {
+        setSteadyStateConfig(prev => ({ ...prev, targetKey: tempLine.key }));
+      }
+    }
+  }, [activeLines.length]);
+
+  // Get all unique headers for the selector with filtering support
+  const displayedSummaryHeaders = useMemo(() => {
+    const targetFiles = summaryFileFilter === "ALL" 
+      ? files 
+      : files.filter(f => f.id === summaryFileFilter);
+
+    const headers = new Set();
+    targetFiles.forEach(f => {
+      f.headers.forEach(h => headers.add(h));
+    });
+    return Array.from(headers).sort();
+  }, [files, summaryFileFilter]);
+
+  // Get all currently selected column names (unique) for Axis assignment
+  const activeColumnNames = useMemo(() => {
+    const cols = new Set();
+    files.forEach(f => {
+      f.selectedCols.forEach(c => cols.add(c));
+    });
+    return Array.from(cols).sort();
+  }, [files]);
+
+
+  // --- Advanced Analysis Calculations ---
+
+  const chartData = useMemo(() => {
+    let maxLength = 0;
+    files.forEach(f => {
+      const len = f.range.end - f.range.start;
+      if (len > maxLength) maxLength = len;
+    });
+
+    const data = [];
+    for (let i = 0; i < maxLength; i++) {
+      const point = { index: i };
+      files.forEach(f => {
+        const actualIndex = f.range.start + i;
+        if (actualIndex < f.range.end) {
+          const row = f.data[actualIndex];
+          f.selectedCols.forEach(col => {
+            const val = row[col];
+            point[`${f.shortName} - ${col}`] = isNaN(val) ? null : val;
+          });
+        }
+      });
+      data.push(point);
+    }
+    return data;
+  }, [files]);
+
+  const steadyStateRegions = useMemo(() => {
+    if (!steadyStateConfig.enabled || !steadyStateConfig.targetKey || !chartData.length) return [];
+    
+    const regions = [];
+    const data = chartData;
+    const key = steadyStateConfig.targetKey;
+    const window = steadyStateConfig.windowSize; // points
+    const threshold = steadyStateConfig.threshold; // deg per minute (approx)
+
+    let startSteady = -1;
+
+    for (let i = window; i < data.length; i++) {
+      const current = data[i][key];
+      const past = data[i - window][key];
+      
+      if (current === null || past === null) continue;
+
+      const diff = Math.abs(current - past);
+      const isSteady = diff <= threshold;
+
+      if (isSteady) {
+        if (startSteady === -1) startSteady = i - window;
+      } else {
+        if (startSteady !== -1) {
+          regions.push({ x1: startSteady, x2: i - 1 });
+          startSteady = -1;
+        }
+      }
+    }
+    if (startSteady !== -1) {
+      regions.push({ x1: startSteady, x2: data.length - 1 });
+    }
+    return regions;
+  }, [chartData, steadyStateConfig]);
+
+  const throttlingEvents = useMemo(() => {
+    if (!throttlingConfig.enabled || activeLines.length === 0) return [];
+    
+    const powerLines = activeLines.filter(l => l.displayName.includes("Power") || l.displayName.includes("W"));
+    const tempLines = activeLines.filter(l => l.displayName.includes("Temp") || l.displayName.includes("Package") || l.displayName.includes("蚓") || l.displayName.includes("(C)"));
+
+    if (powerLines.length === 0 || tempLines.length === 0) return [];
+
+    const events = [];
+    const lookBack = 5; 
+
+    for (let i = lookBack; i < chartData.length; i++) {
+      const isHot = tempLines.some(tl => {
+        const val = chartData[i][tl.key];
+        return val !== null && val >= throttlingConfig.tempThreshold;
+      });
+
+      if (isHot) {
+        powerLines.forEach(pl => {
+          const currP = chartData[i][pl.key];
+          const prevP = chartData[i - lookBack][pl.key];
+          if (currP !== null && prevP !== null && prevP > 5) {
+            const drop = (prevP - currP) / prevP * 100;
+            if (drop >= throttlingConfig.powerDropPercent) {
+              if (events.length === 0 || (i - events[events.length-1].index) > 20) {
+                 events.push({ index: i, powerLine: pl.displayName, drop: drop.toFixed(1), temp: throttlingConfig.tempThreshold });
+              }
+            }
+          }
+        });
+      }
+    }
+    return events;
+  }, [chartData, throttlingConfig, activeLines]);
+
+  const skinTempSensors = useMemo(() => {
+    const sensors = [];
+    files.forEach(f => {
+      f.headers.forEach(h => {
+        if (h.toLowerCase().includes('sen') || h.includes('Skin')) {
+          const key = `${f.shortName} - ${h}`;
+          const isSelected = f.selectedCols.includes(h);
+          sensors.push({ name: h, key: key, file: f.shortName, isSelected });
+        }
+      });
+    });
+    return sensors.sort((a, b) => {
+        if (a.isSelected && !b.isSelected) return -1;
+        if (!a.isSelected && b.isSelected) return 1;
+        return a.name.localeCompare(b.name);
+    });
+  }, [files]);
+
+
+  // --- Handlers ---
+
+  const handleAIAnalysis = async () => {
+     if (commonParamsData.length === 0) {
+      setAiError("沒有足夠的常用參數可供分析");
+      return;
+    }
+    setIsAnalyzing(true);
+    setAiError(null);
+    setAiAnalysis("");
+    const dataContext = {
+      commonParams: commonParamsData.reduce((acc, curr) => {
+        acc[curr.param] = curr.value;
+        return acc;
+      }, {})
+    };
+    if (files.some(f => f.selectedCols.length > 0)) {
+       dataContext.selectedStats = files.map(f => {
+         const statsObj = {};
+         f.selectedCols.forEach(col => {
+           const subset = f.data.slice(f.range.start, f.range.end);
+           const stats = calculateStats(subset, col);
+           statsObj[col] = stats;
+         });
+         return { fileName: f.shortName, stats: statsObj };
+       });
+    }
+    const prompt = `你是專業的熱流工程師。請根據以下 Thermal Log 數據摘要進行分析，指出是否有過熱 (Overheating)、降頻 (Throttling) 或功耗異常的風險。請用繁體中文回答，使用條列式重點說明，並給出建議。
+    數據摘要：${JSON.stringify(dataContext, null, 2)}`;
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) }
+      );
+      if (!response.ok) throw new Error(`API call failed: ${response.status}`);
+      const result = await response.json();
+      const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) setAiAnalysis(text); else throw new Error("No content generated");
+    } catch (error) {
+      console.error("Gemini API Error:", error);
+      setAiError("分析失敗：請檢查 API 連線。");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const handleExport = () => {
+    const headerRow = ['Index', ...activeLines.map(l => l.key)];
+    const csvRows = [headerRow.join(',')];
+    chartData.forEach(row => {
+      const csvRow = [row.index];
+      activeLines.forEach(line => {
+        const val = row[line.key];
+        csvRow.push((val !== undefined && val !== null) ? val : '');
+      });
+      csvRows.push(csvRow.join(','));
+    });
+    const blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', 'selected_raw_data.csv');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleCopyValues = () => {
+    const valuesText = commonParamsData.map(row => row.value).join('\n');
+    const success = copyToClipboard(valuesText);
+    if (success) {
+      setCopiedColumn('values');
+      setTimeout(() => setCopiedColumn(null), 2000);
+    }
+  };
+
+  // --- Drag and Drop Handlers ---
+  const handleDragStart = (e, paramName) => {
+    dragItem.current = paramName; 
+    e.dataTransfer.effectAllowed = "move";
+  };
+
+  const handleDragEnter = (e, paramName) => {
+    dragOverItem.current = paramName;
+    e.preventDefault();
+  };
+
+  const handleSort = () => {
+    const draggedParam = dragItem.current;
+    const targetParam = dragOverItem.current;
+    if (!draggedParam || !targetParam || draggedParam === targetParam) return;
+
+    const _summaryParams = [...summaryParamsOrder];
+    const dragIdx = _summaryParams.indexOf(draggedParam);
+    const targetIdx = _summaryParams.indexOf(targetParam);
+
+    if (dragIdx === -1 || targetIdx === -1) return; 
+
+    _summaryParams.splice(dragIdx, 1);
+    _summaryParams.splice(targetIdx, 0, draggedParam);
+    
+    dragItem.current = null;
+    dragOverItem.current = null;
+    
+    setSummaryParamsOrder(_summaryParams);
+  };
+
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-6 font-sans text-gray-800">
+      <div className="max-w-7xl mx-auto space-y-6">
+        
+        {/* Header */}
+        <header className="flex justify-between items-center bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-2">
+              <BarChart2 className="w-8 h-8 text-blue-600" />
+              Thermal Log 分析工具 (Web版 v6.14)
+            </h1>
+            <p className="text-gray-500 mt-1">支援 GPUmon, PTAT, HW64 等格式解析與 Big5 編碼</p>
+          </div>
+          <div className="flex gap-3">
+             <button 
+              onClick={() => fileInputRef.current.click()}
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition flex items-center gap-2 shadow-sm"
+              disabled={loading}
+            >
+              {loading ? "處理中..." : <><Upload size={18} /> 上傳 CSV</>}
+            </button>
+            <input 
+              type="file" 
+              multiple 
+              accept=".csv" 
+              ref={fileInputRef} 
+              className="hidden" 
+              onChange={handleFileUpload} 
+            />
+          </div>
+        </header>
+
+        {/* File List (Simple) */}
+        {files.length > 0 ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {files.map(file => (
+              <FileCard 
+                key={file.id} 
+                file={file} 
+                onRemove={() => removeFile(file.id)} 
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="text-center py-20 bg-white rounded-xl border border-dashed border-gray-300">
+            <Upload className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+            <h3 className="text-lg font-medium text-gray-500">尚未上傳檔案</h3>
+            <p className="text-gray-400">請點擊上方按鈕上傳 Thermal Log</p>
+          </div>
+        )}
+
+        {/* Common Params Summary & AI Analysis */}
+        {files.length > 0 && (
+          <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 relative">
+            <div className="flex justify-between items-center mb-4">
+              <div className="flex items-center gap-3">
+                <h2 className="text-lg font-semibold flex items-center gap-2">
+                  <Settings size={20} className="text-purple-600" />
+                  常用參數彙總 (取最後 600 筆平均)
+                </h2>
+                <div className="flex gap-1">
+                  <button 
+                    onClick={() => setShowSummarySelector(!showSummarySelector)}
+                    className="text-xs flex items-center gap-1 bg-gray-100 hover:bg-gray-200 text-gray-600 px-2 py-1 rounded transition-colors"
+                  >
+                    {showSummarySelector ? <X size={12}/> : <Plus size={12}/>} 
+                    {showSummarySelector ? "關閉選擇" : "選擇更多參數"}
+                  </button>
+                </div>
+              </div>
+              <button 
+                onClick={handleAIAnalysis}
+                disabled={isAnalyzing || commonParamsData.length === 0}
+                className={`px-4 py-2 rounded-lg text-white text-sm font-medium flex items-center gap-2 transition-all shadow-sm ${isAnalyzing ? 'bg-purple-400 cursor-not-allowed' : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700'}`}
+              >
+                {isAnalyzing ? <><Loader2 className="animate-spin w-4 h-4" /> 分析中...</> : <><Sparkles className="w-4 h-4" /> AI 智慧診斷</>}
+              </button>
+            </div>
+
+            {/* Custom Param Selector Panel with File Filter */}
+            {showSummarySelector && (
+              <div className="mb-4 p-4 bg-gray-50 border border-gray-200 rounded-lg animate-in fade-in slide-in-from-top-2">
+                
+                <div className="flex gap-2 mb-3">
+                  <div className="w-1/3">
+                    <select
+                      value={summaryFileFilter}
+                      onChange={(e) => setSummaryFileFilter(e.target.value)}
+                      className="w-full p-1.5 border border-gray-300 rounded text-xs outline-none focus:border-purple-400 bg-white"
+                    >
+                      <option value="ALL">📂 所有檔案 (All Files)</option>
+                      {files.map(f => (
+                        <option key={f.id} value={f.id}>{f.shortName}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex-1 flex items-center gap-2 relative">
+                    <Search size={14} className="absolute left-2 text-gray-400"/>
+                    <input 
+                      type="text" 
+                      placeholder="搜尋欄位名稱..." 
+                      className="w-full pl-7 pr-2 py-1.5 bg-white border border-gray-300 rounded text-xs outline-none focus:border-purple-400"
+                      value={summarySearchTerm}
+                      onChange={(e) => setSummarySearchTerm(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 max-h-48 overflow-y-auto custom-scrollbar bg-white p-2 border border-gray-100 rounded">
+                  {displayedSummaryHeaders
+                    .filter(h => h.toLowerCase().includes(summarySearchTerm.toLowerCase()))
+                    .map(h => {
+                      const isCommon = COMMON_PARAMS.some(cp => normalize(cp) === normalize(h));
+                      const isSelected = summaryParamsOrder.includes(h);
+                      const isChecked = isSelected;
+                      
+                      return (
+                        <label key={h} className={`flex items-center gap-2 p-1.5 rounded text-xs cursor-pointer select-none ${isChecked ? 'bg-purple-50 text-purple-700' : 'hover:bg-gray-100 text-gray-600'}`}>
+                          <input 
+                            type="checkbox" 
+                            disabled={isCommon} 
+                            checked={isChecked}
+                            onChange={() => {
+                              if (isCommon) return;
+                              setSummaryParamsOrder(prev => 
+                                prev.includes(h) ? prev.filter(p => p !== h) : [...prev, h]
+                              );
+                            }}
+                            className="rounded text-purple-600 focus:ring-purple-500"
+                          />
+                          <span className="truncate" title={h}>
+                            {h} {isCommon && <span className="text-[10px] text-gray-400 ml-1">(預設)</span>}
+                          </span>
+                        </label>
+                      );
+                    })}
+                    {displayedSummaryHeaders.length === 0 && <div className="col-span-full text-center text-xs text-gray-400 py-4">此檔案無可用參數</div>}
+                </div>
+              </div>
+            )}
+
+            {(aiAnalysis || aiError) && (
+              <div className="mb-6 p-4 rounded-lg bg-indigo-50 border border-indigo-100 animate-in fade-in slide-in-from-top-2 duration-300">
+                <h3 className="font-bold text-indigo-900 flex items-center gap-2 mb-2">
+                  <Sparkles className="w-4 h-4 text-indigo-600" />
+                  Gemini 分析報告
+                </h3>
+                {aiError ? (
+                  <div className="text-red-600 text-sm flex items-center gap-2"><AlertCircle className="w-4 h-4" /> {aiError}</div>
+                ) : (
+                  <div className="prose prose-sm text-indigo-800 max-w-none whitespace-pre-wrap leading-relaxed">{aiAnalysis}</div>
+                )}
+              </div>
+            )}
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="w-8 px-2 py-3 select-none"></th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider select-none">參數名稱</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider flex items-center gap-2 select-none">
+                      數值
+                      <button 
+                        onClick={handleCopyValues}
+                        className="p-1 hover:bg-gray-200 rounded text-gray-500 transition-colors"
+                        title="複製整列數值"
+                      >
+                        {copiedColumn === 'values' ? <Check size={14} className="text-green-600"/> : <Copy size={14}/>}
+                      </button>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {commonParamsData.map((row, idx) => {
+                    return (
+                      <tr 
+                        key={`${row.param}-${idx}`} 
+                        className="hover:bg-gray-50 group"
+                        onDragEnter={(e) => handleDragEnter(e, row.param)}
+                        onDragOver={(e) => e.preventDefault()}
+                      >
+                        <td 
+                          className="px-2 py-2 text-gray-400 group-hover:text-gray-600 text-center cursor-grab active:cursor-grabbing select-none"
+                          draggable
+                          onDragStart={(e) => handleDragStart(e, row.param)}
+                          onDragEnd={handleSort}
+                        >
+                          <GripVertical size={16} />
+                        </td>
+                        <td className="px-6 py-2 text-sm font-medium text-gray-900 flex items-center gap-2 select-none">
+                          {row.param}
+                          {row.isCustom && <span className="text-[10px] bg-purple-100 text-purple-600 px-1.5 rounded-full select-none">Custom</span>}
+                        </td>
+                        <td className="px-6 py-2 text-sm text-gray-500 font-mono select-text">{row.value}</td>
+                      </tr>
+                    );
+                  })}
+                  {commonParamsData.length === 0 && <tr><td colSpan="3" className="px-6 py-4 text-center text-sm text-gray-400">無符合的常用參數</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Advanced Analysis & Chart Section */}
+        {files.length > 0 && (
+          <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 space-y-6">
+            
+            {/* Control Toolbar */}
+            <div className="flex flex-wrap items-center justify-between gap-4 border-b border-gray-100 pb-4">
+               <div className="flex items-center gap-4">
+                 {/* Chart Mode Toggle */}
+                 <div className="flex bg-gray-100 p-1 rounded-lg">
+                   <button 
+                    onClick={() => setChartMode('time')}
+                    className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${chartMode === 'time' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                   >
+                     時間序列圖 (Time)
+                   </button>
+                   <button 
+                    onClick={() => setChartMode('xy')}
+                    className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${chartMode === 'xy' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                   >
+                     XY 關聯圖 (Scatter)
+                   </button>
+                 </div>
+                 
+                 {/* Quick Config Toggles */}
+                 {chartMode === 'time' && (
+                   <div className="flex gap-2">
+                     <button 
+                      onClick={() => setShowGlobalSearch(!showGlobalSearch)}
+                      className={`flex items-center gap-1 px-3 py-1.5 rounded-md text-sm border ${showGlobalSearch ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-white border-gray-200 text-gray-600'}`}
+                     >
+                       <Search size={14} /> 全域參數搜尋
+                     </button>
+                     <button 
+                      onClick={() => setShowAxisSettings(!showAxisSettings)}
+                      className={`flex items-center gap-1 px-3 py-1.5 rounded-md text-sm border ${showAxisSettings ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-white border-gray-200 text-gray-600'}`}
+                     >
+                       <SlidersHorizontal size={14} /> 座標軸設定
+                     </button>
+                     <button 
+                      onClick={() => setSteadyStateConfig(prev => ({...prev, enabled: !prev.enabled}))}
+                      className={`flex items-center gap-1 px-3 py-1.5 rounded-md text-sm border ${steadyStateConfig.enabled ? 'bg-green-50 border-green-200 text-green-700' : 'bg-white border-gray-200 text-gray-600'}`}
+                     >
+                       <Activity size={14} /> 穩態偵測
+                     </button>
+                     <button 
+                      onClick={() => setThrottlingConfig(prev => ({...prev, enabled: !prev.enabled}))}
+                      className={`flex items-center gap-1 px-3 py-1.5 rounded-md text-sm border ${throttlingConfig.enabled ? 'bg-red-50 border-red-200 text-red-700' : 'bg-white border-gray-200 text-gray-600'}`}
+                     >
+                       <AlertTriangle size={14} /> 降頻偵測
+                     </button>
+                     <button 
+                      onClick={() => setShowSkinSettings(!showSkinSettings)}
+                      className={`flex items-center gap-1 px-3 py-1.5 rounded-md text-sm border ${Object.keys(skinTempLimits).length > 0 ? 'bg-orange-50 border-orange-200 text-orange-700' : 'bg-white border-gray-200 text-gray-600'}`}
+                     >
+                       <Thermometer size={14} /> 表面溫度規範
+                     </button>
+                   </div>
+                 )}
+               </div>
+
+               {/* Right Side Actions */}
+               <div className="flex gap-2">
+                 <button 
+                    onClick={handleClearAll} 
+                    className="px-3 py-1.5 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition flex items-center gap-2 text-sm"
+                    title="清除所有選取參數"
+                 >
+                    <Eraser size={14} /> 清除所有選取
+                 </button>
+                 <button onClick={handleExport} className="px-3 py-1.5 bg-green-600 text-white rounded-lg hover:bg-green-700 transition flex items-center gap-2 text-sm">
+                    <Download size={14} /> 匯出 CSV
+                 </button>
+               </div>
+            </div>
+
+            {/* Config Panels */}
+            {chartMode === 'time' && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+                
+                {/* Global Search Panel with File Filter */}
+                {showGlobalSearch && (
+                  <div className="p-3 bg-blue-50 rounded-lg border border-blue-100 col-span-1 md:col-span-3">
+                    <h4 className="font-semibold text-blue-800 mb-2 flex items-center gap-1"><Search size={14}/> 搜尋所有檔案參數 (繪圖用)</h4>
+                    
+                    <div className="flex gap-2 mb-3">
+                      <div className="w-1/3">
+                        <select
+                          value={globalFileFilter}
+                          onChange={(e) => setGlobalFileFilter(e.target.value)}
+                          className="w-full p-1.5 border border-blue-200 rounded text-xs outline-none focus:border-blue-400 bg-white"
+                        >
+                          <option value="ALL">📂 所有檔案 (All Files)</option>
+                          {files.map(f => (
+                            <option key={f.id} value={f.id}>{f.shortName}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="flex-1 flex items-center gap-2 relative">
+                        <Search size={14} className="absolute left-2 text-gray-400"/>
+                        <input 
+                          type="text" 
+                          placeholder="輸入關鍵字 (例如: temp, power)..." 
+                          className="w-full pl-7 pr-2 py-1.5 border border-blue-200 rounded text-xs outline-none focus:border-blue-400 bg-white"
+                          value={globalSearchTerm}
+                          onChange={(e) => setGlobalSearchTerm(e.target.value)}
+                          autoFocus
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2 max-h-60 overflow-y-auto pr-2 custom-scrollbar bg-white p-2 border border-blue-50 rounded">
+                       {files
+                         .filter(f => globalFileFilter === "ALL" || f.id === globalFileFilter)
+                         .map(f => {
+                           const matches = f.headers
+                             .filter(h => !globalSearchTerm || h.toLowerCase().includes(globalSearchTerm.toLowerCase()))
+                             .sort((a, b) => {
+                               const aSelected = f.selectedCols.includes(a);
+                               const bSelected = f.selectedCols.includes(b);
+                               if (aSelected && !bSelected) return -1;
+                               if (!aSelected && bSelected) return 1;
+                               return 0; 
+                             });
+                           
+                           if (matches.length === 0) return null;
+
+                           return matches.map(h => (
+                             <label key={`${f.id}-${h}`} className={`flex items-center gap-2 p-1.5 rounded border cursor-pointer ${f.selectedCols.includes(h) ? 'bg-blue-50 border-blue-300' : 'bg-white border-blue-100 hover:border-blue-300'}`}>
+                                <input 
+                                  type="checkbox" 
+                                  checked={f.selectedCols.includes(h)} 
+                                  onChange={() => {
+                                    const newCols = f.selectedCols.includes(h)
+                                      ? f.selectedCols.filter(c => c !== h)
+                                      : [...f.selectedCols, h];
+                                    updateFileSelection(f.id, 'selectedCols', newCols);
+                                  }}
+                                  className="rounded text-blue-600 focus:ring-blue-500"
+                                />
+                                <div className="min-w-0">
+                                  <div className="text-xs font-medium text-gray-700 truncate" title={h}>{h}</div>
+                                  <div className="text-[10px] text-gray-400 truncate">{f.shortName}</div>
+                                </div>
+                             </label>
+                           ));
+                       })}
+                       {(files.filter(f => globalFileFilter === "ALL" || f.id === globalFileFilter).every(f => !f.headers.some(h => h.toLowerCase().includes(globalSearchTerm.toLowerCase())))) && (
+                         <div className="col-span-full text-center text-gray-500 py-4 text-xs">無符合搜尋結果</div>
+                       )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Axis Settings Panel */}
+                {showAxisSettings && (
+                  <div className="p-3 bg-blue-50 rounded-lg border border-blue-100 col-span-1 md:col-span-3">
+                    <h4 className="font-semibold text-blue-800 mb-2 flex items-center gap-1"><SlidersHorizontal size={14}/> 座標軸設定 & 副座標軸 (Dual Axis)</h4>
+                    <div className="flex flex-wrap gap-6 mb-4">
+                      {/* Left Axis Config */}
+                      <div className="flex items-center gap-2 bg-white p-2 rounded border border-blue-100">
+                        <span className="text-xs font-bold text-gray-500">左軸範圍:</span>
+                        <input 
+                          type="number" 
+                          placeholder="Min (Auto)" 
+                          className="w-20 p-1 border rounded text-xs"
+                          value={yAxisConfig.left.min}
+                          onChange={(e) => setYAxisConfig(prev => ({ ...prev, left: { ...prev.left, min: e.target.value } }))}
+                        />
+                        <span className="text-gray-400">-</span>
+                        <input 
+                          type="number" 
+                          placeholder="Max (Auto)" 
+                          className="w-20 p-1 border rounded text-xs"
+                          value={yAxisConfig.left.max}
+                          onChange={(e) => setYAxisConfig(prev => ({ ...prev, left: { ...prev.left, max: e.target.value } }))}
+                        />
+                      </div>
+                      
+                      {/* Right Axis Config */}
+                      <div className="flex items-center gap-2 bg-white p-2 rounded border border-blue-100">
+                        <span className="text-xs font-bold text-gray-500">右軸範圍:</span>
+                        <input 
+                          type="number" 
+                          placeholder="Min (Auto)" 
+                          className="w-20 p-1 border rounded text-xs"
+                          value={yAxisConfig.right.min}
+                          onChange={(e) => setYAxisConfig(prev => ({ ...prev, right: { ...prev.right, min: e.target.value } }))}
+                        />
+                        <span className="text-gray-400">-</span>
+                        <input 
+                          type="number" 
+                          placeholder="Max (Auto)" 
+                          className="w-20 p-1 border rounded text-xs"
+                          value={yAxisConfig.right.max}
+                          onChange={(e) => setYAxisConfig(prev => ({ ...prev, right: { ...prev.right, max: e.target.value } }))}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Secondary Axis Assignment */}
+                    <div className="bg-white p-2 rounded border border-blue-100">
+                      <div className="text-xs font-bold text-gray-500 mb-2">選擇使用「右側 Y 軸」的參數 (例如: Power):</div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 max-h-32 overflow-y-auto custom-scrollbar">
+                        {activeColumnNames.length > 0 ? activeColumnNames.map(col => (
+                          <label key={col} className={`flex items-center gap-2 p-1 rounded text-xs cursor-pointer select-none ${rightAxisCols.has(col) ? 'bg-indigo-50 text-indigo-700' : 'hover:bg-gray-50 text-gray-600'}`}>
+                            <input 
+                              type="checkbox"
+                              checked={rightAxisCols.has(col)}
+                              onChange={() => {
+                                const next = new Set(rightAxisCols);
+                                if (next.has(col)) next.delete(col);
+                                else next.add(col);
+                                setRightAxisCols(next);
+                              }}
+                              className="rounded text-indigo-600 focus:ring-indigo-500"
+                            />
+                            <span className="truncate" title={col}>{col}</span>
+                          </label>
+                        )) : <span className="text-gray-400 text-xs italic">尚未勾選任何繪圖參數</span>}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Steady State Config */}
+                {steadyStateConfig.enabled && (
+                  <div className="p-3 bg-green-50 rounded-lg border border-green-100">
+                    <h4 className="font-semibold text-green-800 mb-2 flex items-center gap-1"><Activity size={14}/> 穩態設定</h4>
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                         <span className="text-green-700">目標參數:</span>
+                         <select 
+                           value={steadyStateConfig.targetKey} 
+                           onChange={(e) => setSteadyStateConfig(prev => ({...prev, targetKey: e.target.value}))}
+                           className="text-xs p-1 border rounded w-32"
+                         >
+                           {activeLines.map(l => <option key={l.key} value={l.key}>{l.displayName}</option>)}
+                         </select>
+                      </div>
+                      <div className="flex items-center justify-between">
+                         <span className="text-green-700" title="判定窗口大小 (秒)">窗口 (sec):</span>
+                         <input type="number" className="w-16 p-1 border rounded text-xs" value={steadyStateConfig.windowSize} onChange={(e) => setSteadyStateConfig(prev => ({...prev, windowSize: Number(e.target.value)}))} />
+                      </div>
+                      <div className="flex items-center justify-between">
+                         <span className="text-green-700" title="每分鐘變化小於此值即視為穩態">閾值 (°C/min):</span>
+                         <input type="number" step="0.1" className="w-16 p-1 border rounded text-xs" value={steadyStateConfig.threshold} onChange={(e) => setSteadyStateConfig(prev => ({...prev, threshold: Number(e.target.value)}))} />
+                      </div>
+                    </div>
+                  </div>
+                )}
+                
+                {/* Throttling Config */}
+                {throttlingConfig.enabled && (
+                  <div className="p-3 bg-red-50 rounded-lg border border-red-100">
+                    <h4 className="font-semibold text-red-800 mb-2 flex items-center gap-1"><AlertTriangle size={14}/> 降頻判定</h4>
+                    <div className="space-y-2">
+                       <div className="flex items-center justify-between">
+                         <span className="text-red-700">觸發溫度 (°C):</span>
+                         <input type="number" className="w-16 p-1 border rounded text-xs" value={throttlingConfig.tempThreshold} onChange={(e) => setThrottlingConfig(prev => ({...prev, tempThreshold: Number(e.target.value)}))} />
+                      </div>
+                      <div className="flex items-center justify-between">
+                         <span className="text-red-700">功耗降幅 (%):</span>
+                         <input type="number" className="w-16 p-1 border rounded text-xs" value={throttlingConfig.powerDropPercent} onChange={(e) => setThrottlingConfig(prev => ({...prev, powerDropPercent: Number(e.target.value)}))} />
+                      </div>
+                       <div className="text-xs text-red-600 mt-1">
+                          * 自動偵測高溫時功耗驟降的事件
+                       </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Skin Temp Config */}
+                {showSkinSettings && (
+                  <div className="p-3 bg-orange-50 rounded-lg border border-orange-100 col-span-1 md:col-span-3">
+                    <h4 className="font-semibold text-orange-800 mb-2 flex items-center gap-1"><Thermometer size={14}/> 表面溫度規範上限 (°C)</h4>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 max-h-60 overflow-y-auto custom-scrollbar pr-2">
+                      {skinTempSensors.map(sensor => (
+                        <div key={sensor.key} className={`flex items-center gap-2 p-1 rounded ${sensor.isSelected ? 'bg-orange-100' : ''}`}>
+                           <span className={`text-xs truncate w-24 ${sensor.isSelected ? 'font-bold text-orange-900' : 'text-orange-700'}`} title={sensor.name}>{sensor.name}</span>
+                           <input 
+                             type="number" 
+                             placeholder="Limit"
+                             className="w-16 p-1 border rounded text-xs"
+                             value={skinTempLimits[sensor.name] || ''}
+                             onChange={(e) => {
+                               const val = e.target.value;
+                               setSkinTempLimits(prev => {
+                                 const next = { ...prev };
+                                 if (val) next[sensor.name] = Number(val);
+                                 else delete next[sensor.name];
+                                 return next;
+                               });
+                             }}
+                           />
+                        </div>
+                      ))}
+                      {skinTempSensors.length === 0 && <span className="text-xs text-orange-500">未偵測到 'SEN' 相關欄位</span>}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* XY Config Panel */}
+            {chartMode === 'xy' && (
+               <div className="p-4 bg-gray-50 rounded-lg flex gap-6 items-end">
+                 <div className="flex-1">
+                    <label className="block text-xs font-semibold text-gray-500 mb-1">X 軸資料來源</label>
+                    <select 
+                      className="w-full p-2 border rounded-md text-sm"
+                      value={xyConfig.x}
+                      onChange={(e) => setXyConfig(prev => ({ ...prev, x: e.target.value }))}
+                    >
+                      {activeLines.map(l => <option key={l.key} value={l.key}>{l.displayName}</option>)}
+                    </select>
+                 </div>
+                 <div className="flex items-center pb-2 text-gray-400"><ArrowRightLeft size={20} /></div>
+                 <div className="flex-1">
+                    <label className="block text-xs font-semibold text-gray-500 mb-1">Y 軸資料來源</label>
+                    <select 
+                      className="w-full p-2 border rounded-md text-sm"
+                      value={xyConfig.y}
+                      onChange={(e) => setXyConfig(prev => ({ ...prev, y: e.target.value }))}
+                    >
+                      {activeLines.map(l => <option key={l.key} value={l.key}>{l.displayName}</option>)}
+                    </select>
+                 </div>
+               </div>
+            )}
+
+            {/* Chart Area */}
+            <div className="h-[500px] w-full relative">
+              <div className="absolute top-0 right-0 z-10">
+                 <input 
+                  type="text" 
+                  value={chartTitle} 
+                  onChange={(e) => setChartTitle(e.target.value)}
+                  className="text-right text-sm text-gray-500 bg-transparent border-none focus:ring-0 placeholder-gray-300"
+                  placeholder="圖表標題"
+                 />
+              </div>
+
+              <ResponsiveContainer width="100%" height="100%">
+                {chartMode === 'time' ? (
+                  <ComposedChart data={chartData} margin={{ top: 35, right: 40, left: 20, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
+                    <XAxis dataKey="index" />
+                    <YAxis 
+                      yAxisId="left"
+                      domain={[
+                        yAxisConfig.left.min !== '' ? Number(yAxisConfig.left.min) : 'auto', 
+                        yAxisConfig.left.max !== '' ? Number(yAxisConfig.left.max) : 'auto'
+                      ]} 
+                    />
+                    <YAxis 
+                      yAxisId="right" 
+                      orientation="right" 
+                      domain={[
+                        yAxisConfig.right.min !== '' ? Number(yAxisConfig.right.min) : 'auto', 
+                        yAxisConfig.right.max !== '' ? Number(yAxisConfig.right.max) : 'auto'
+                      ]} 
+                    />
+                    <Tooltip contentStyle={{ backgroundColor: 'rgba(255, 255, 255, 0.95)', borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)' }} />
+                    <Legend wrapperStyle={{ paddingTop: '20px' }} />
+                    
+                    {/* Data Lines */}
+                    {activeLines.map((line) => (
+                      <Line 
+                        key={line.key}
+                        yAxisId={line.isRightAxis ? "right" : "left"}
+                        type="monotone" 
+                        dataKey={line.key} 
+                        name={line.displayName}
+                        stroke={line.color} 
+                        dot={false}
+                        strokeWidth={2}
+                        isAnimationActive={false}
+                      />
+                    ))}
+
+                    {/* Steady State Highlights */}
+                    {steadyStateRegions.map((region, i) => (
+                      <ReferenceArea 
+                        key={`steady-${i}`} 
+                        yAxisId="left"
+                        x1={region.x1} 
+                        x2={region.x2} 
+                        fill="rgba(16, 185, 129, 0.1)" 
+                        strokeOpacity={0}
+                      />
+                    ))}
+
+                    {/* Throttling Markers */}
+                    {throttlingEvents.map((evt, i) => (
+                       <ReferenceLine key={`thr-${i}`} yAxisId="left" x={evt.index} stroke="red" strokeDasharray="3 3" label={{ position: 'top', value: '降頻', fill: 'red', fontSize: 10 }} />
+                    ))}
+
+                    {/* Skin Temp Limits */}
+                    {activeLines.map(line => {
+                      // Check if this line matches a limit
+                      // line.colName matches key in skinTempLimits?
+                      // skinTempLimits keys are short names e.g. "SEN1"
+                      // line.displayName e.g. "SEN1"
+                      const limit = skinTempLimits[line.displayName];
+                      if (limit !== undefined) {
+                        return <ReferenceLine key={`limit-${line.key}`} yAxisId={line.isRightAxis ? "right" : "left"} y={limit} stroke={line.color} strokeDasharray="5 5" label={{ value: `Limit ${limit}`, position: 'right', fill: line.color, fontSize: 10 }} />
+                      }
+                      return null;
+                    })}
+
+                  </ComposedChart>
+                ) : (
+                  <ScatterChart margin={{ top: 35, right: 20, bottom: 20, left: 20 }}>
+                    <CartesianGrid />
+                    <XAxis type="number" dataKey={xyConfig.x} name={activeLines.find(l=>l.key===xyConfig.x)?.displayName || 'X'} unit="" />
+                    <YAxis type="number" dataKey={xyConfig.y} name={activeLines.find(l=>l.key===xyConfig.y)?.displayName || 'Y'} unit="" />
+                    <ZAxis type="number" range={[50, 50]} />
+                    <Tooltip cursor={{ strokeDasharray: '3 3' }} />
+                    <Legend />
+                    <Scatter name="Data" data={chartData} fill="#8884d8" />
+                  </ScatterChart>
+                )}
+              </ResponsiveContainer>
+            </div>
+
+            {/* Event Logs for Time Mode */}
+            {chartMode === 'time' && (throttlingEvents.length > 0 || steadyStateRegions.length > 0) && (
+              <div className="bg-gray-50 rounded-lg p-4 text-xs space-y-2 max-h-40 overflow-y-auto">
+                 {steadyStateRegions.length > 0 && (
+                   <div>
+                     <span className="font-bold text-green-700">穩態區間:</span> {steadyStateRegions.map(r => `[${r.x1}~${r.x2}]`).join(', ')}
+                   </div>
+                 )}
+                 {throttlingEvents.length > 0 && (
+                   <div>
+                     <span className="font-bold text-red-700">潛在降頻事件:</span>
+                     <ul className="list-disc list-inside mt-1 text-gray-600">
+                       {throttlingEvents.map((e, i) => (
+                         <li key={i}>Index {e.index}: {e.powerLine} 驟降 {e.drop}% (Temp &gt; {e.temp}°C)</li>
+                       ))}
+                     </ul>
+                   </div>
+                 )}
+              </div>
+            )}
+
+            {/* New Section: Detailed Analysis Panel (Renamed & Enhanced) */}
+            {files.length > 0 && (
+              <div className="pt-6 border-t border-gray-200">
+                <h3 className="font-bold text-gray-800 mb-4 flex items-center gap-2">
+                  <Table2 size={20} className="text-gray-600"/>
+                  檔案配置與統計 (Analysis & Stats)
+                </h3>
+                
+                <div className="grid grid-cols-1 gap-6">
+                  {files.map(file => (
+                    <FileAnalysisPanel 
+                      key={file.id} 
+                      file={file} 
+                      updateFileSelection={updateFileSelection}
+                      calculateStats={calculateStats}
+                      activeLines={activeLines}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+// --- Sub-components ---
+
+// Simplified FileCard (Top)
+function FileCard({ file, onRemove }) {
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden p-3 flex justify-between items-center">
+        <div className="flex items-center gap-3 overflow-hidden">
+          <div className="bg-blue-100 p-2 rounded-lg shrink-0">
+            <FileText size={20} className="text-blue-600" />
+          </div>
+          <div className="min-w-0">
+            <h3 className="font-semibold text-gray-800 truncate text-sm" title={file.name}>
+              {file.shortName}
+            </h3>
+            <div className="flex items-center gap-2 mt-0.5">
+               <span className="text-[10px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded">
+                {file.type}
+              </span>
+              <span className="text-[10px] text-blue-600">
+                {file.selectedCols.length} 參數已選
+              </span>
+            </div>
+          </div>
+        </div>
+        <button onClick={onRemove} className="p-1.5 hover:bg-red-50 rounded text-gray-400 hover:text-red-500 shrink-0">
+          <Trash2 size={16} />
+        </button>
+    </div>
+  );
+}
+
+// Enhanced Analysis Panel (Bottom)
+function FileAnalysisPanel({ file, updateFileSelection, calculateStats, activeLines }) {
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const toggleCol = (col) => {
+    const newCols = file.selectedCols.includes(col)
+      ? file.selectedCols.filter(c => c !== col)
+      : [...file.selectedCols, col];
+    updateFileSelection(file.id, 'selectedCols', newCols);
+  };
+
+  // Sort headers: Selected first, then matches by term
+  const sortedHeaders = useMemo(() => {
+    return [...file.headers]
+      .filter(col => col.toLowerCase().includes(searchTerm.toLowerCase()))
+      .sort((a, b) => {
+        const aSelected = file.selectedCols.includes(a);
+        const bSelected = file.selectedCols.includes(b);
+        if (aSelected && !bSelected) return -1;
+        if (!aSelected && bSelected) return 1;
+        return 0; 
+      });
+  }, [file.headers, file.selectedCols, searchTerm]);
+
+  return (
+    <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
+      
+      {/* 1. Header & Range Controls */}
+      <div className="flex flex-wrap items-center justify-between gap-4 mb-4 border-b border-gray-200 pb-3">
+        <div className="font-semibold text-gray-700 flex items-center gap-2">
+          <FileText size={16} /> {file.shortName}
+        </div>
+        <div className="flex items-center gap-2 text-sm">
+          <span className="text-gray-500">分析範圍:</span>
+          <div className="flex items-center bg-white rounded border border-gray-300">
+            <span className="px-2 text-gray-400 bg-gray-50 border-r text-xs">Start</span>
+            <input 
+              type="number" 
+              min="0" 
+              max={file.range.end - 1} 
+              value={file.range.start} 
+              onChange={(e) => updateFileSelection(file.id, 'range', { ...file.range, start: Number(e.target.value) })} 
+              className="w-20 p-1 text-center outline-none"
+            />
+          </div>
+          <span className="text-gray-400">-</span>
+          <div className="flex items-center bg-white rounded border border-gray-300">
+            <span className="px-2 text-gray-400 bg-gray-50 border-r text-xs">End</span>
+            <input 
+              type="number" 
+              min={file.range.start + 1} 
+              max={file.data.length} 
+              value={file.range.end} 
+              onChange={(e) => updateFileSelection(file.id, 'range', { ...file.range, end: Number(e.target.value) })} 
+              className="w-20 p-1 text-center outline-none"
+            />
+          </div>
+          <span className="text-xs text-gray-400 ml-1">(Total: {file.data.length})</span>
+        </div>
+      </div>
+
+      {/* 2. Split View: Selector (Left) & Stats (Right) */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        {/* Left: Column Selector */}
+        <div className="lg:col-span-4 flex flex-col h-64 border border-gray-200 rounded-lg bg-white overflow-hidden">
+           <div className="p-2 border-b border-gray-100 bg-gray-50 flex items-center justify-between">
+              <div className="flex items-center gap-1 text-xs font-medium text-gray-600">
+                <ListFilter size={14}/> 欄位選擇 ({file.selectedCols.length})
+                {file.selectedCols.length > 0 && (
+                  <button 
+                    onClick={() => updateFileSelection(file.id, 'selectedCols', [])}
+                    className="ml-2 p-1 hover:bg-red-100 text-red-500 rounded transition-colors"
+                    title="清除此檔案所有選取"
+                  >
+                    <Eraser size={12} />
+                  </button>
+                )}
+              </div>
+           </div>
+           <div className="p-2 border-b border-gray-100">
+              <div className="relative">
+                <Search className="absolute left-2 top-1/2 transform -translate-y-1/2 w-3 h-3 text-gray-400" />
+                <input 
+                  type="text" 
+                  placeholder="搜尋參數..." 
+                  value={searchTerm} 
+                  onChange={(e) => setSearchTerm(e.target.value)} 
+                  className="w-full pl-7 pr-2 py-1 text-xs border border-gray-200 rounded focus:outline-none focus:border-blue-400" 
+                />
+              </div>
+           </div>
+           <div className="flex-1 overflow-y-auto p-2 space-y-1 custom-scrollbar">
+              {sortedHeaders.map((col, idx) => (
+                <label key={`${col}-${idx}`} className={`flex items-center gap-2 text-xs p-1.5 rounded cursor-pointer transition-colors ${file.selectedCols.includes(col) ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50 text-gray-600'}`}>
+                  <input 
+                    type="checkbox" 
+                    checked={file.selectedCols.includes(col)} 
+                    onChange={() => toggleCol(col)} 
+                    className="rounded text-blue-600 focus:ring-blue-500 w-3 h-3" 
+                  />
+                  <span className="truncate" title={col}>{col}</span>
+                </label>
+              ))}
+              {sortedHeaders.length === 0 && <div className="text-center text-xs text-gray-400 py-4">無符合結果</div>}
+           </div>
+        </div>
+
+        {/* Right: Stats Table */}
+        <div className="lg:col-span-8 flex flex-col h-64 border border-gray-200 rounded-lg bg-white overflow-hidden">
+           <div className="p-2 border-b border-gray-100 bg-gray-50 flex items-center justify-between">
+              <div className="flex items-center gap-1 text-xs font-medium text-gray-600">
+                <Table2 size={14}/> 統計數據預覽
+              </div>
+           </div>
+           <div className="flex-1 overflow-y-auto custom-scrollbar">
+              <table className="w-full text-xs text-left">
+                <thead className="text-xs text-gray-500 uppercase bg-gray-50 sticky top-0 z-10">
+                  <tr>
+                    <th className="px-4 py-2 border-b">參數名稱</th>
+                    <th className="px-4 py-2 text-right border-b">Max</th>
+                    <th className="px-4 py-2 text-right border-b">Min</th>
+                    <th className="px-4 py-2 text-right border-b">Avg</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {file.selectedCols.length > 0 ? (
+                    file.selectedCols.map((col) => {
+                      const subset = file.data.slice(file.range.start, file.range.end);
+                      const stats = calculateStats(subset, col);
+                      const lineConfig = activeLines.find(l => l.fileId === file.id && l.colName === col);
+                      const color = lineConfig ? lineConfig.color : '#ccc';
+
+                      return (
+                        <tr key={col} className="hover:bg-gray-50">
+                          <td className="px-4 py-2 font-medium text-gray-700 flex items-center gap-2">
+                            <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: color }}></div>
+                            <span className="truncate max-w-[150px]" title={col}>{col}</span>
+                          </td>
+                          <td className="px-4 py-2 text-right font-mono text-gray-600">{stats.max}</td>
+                          <td className="px-4 py-2 text-right font-mono text-gray-600">{stats.min}</td>
+                          <td className="px-4 py-2 text-right font-mono font-bold text-gray-800">{stats.mean}</td>
+                        </tr>
+                      );
+                    })
+                  ) : (
+                    <tr>
+                      <td colSpan="4" className="text-center text-gray-400 py-8 italic">
+                        請從左側列表選擇參數以查看統計數據
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+           </div>
+        </div>
+
+      </div>
+    </div>
+  );
+}
